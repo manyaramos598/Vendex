@@ -5,11 +5,18 @@
 (define-constant ERR_ALREADY_REVIEWED (err u103))
 (define-constant ERR_VENDOR_EXISTS (err u104))
 (define-constant ERR_NFT_NOT_FOUND (err u105))
+(define-constant ERR_ALREADY_SUBSCRIBED (err u106))
+(define-constant ERR_NOT_SUBSCRIBED (err u107))
+(define-constant ERR_INSUFFICIENT_POINTS (err u108))
+(define-constant ERR_INVALID_TIER (err u109))
+(define-constant ERR_INVALID_REWARD (err u110))
 
 (define-non-fungible-token vendor-nft uint)
 
 (define-data-var next-vendor-id uint u1)
 (define-data-var next-review-id uint u1)
+(define-data-var next-subscription-id uint u1)
+(define-data-var next-reward-id uint u1)
 
 (define-map vendors
   { vendor-id: uint }
@@ -44,6 +51,65 @@
 (define-map vendor-owner-lookup
   { owner: principal }
   { vendor-id: uint }
+)
+
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    subscriber: principal,
+    vendor-id: uint,
+    tier: uint,
+    loyalty-points: uint,
+    subscription-date: uint,
+    is-active: bool
+  }
+)
+
+(define-map user-subscriptions
+  { subscriber: principal, vendor-id: uint }
+  { subscription-id: uint }
+)
+
+(define-map loyalty-points
+  { user: principal }
+  { total-points: uint }
+)
+
+(define-map vendor-rewards
+  { reward-id: uint }
+  {
+    vendor-id: uint,
+    reward-name: (string-ascii 50),
+    points-required: uint,
+    max-redemptions: uint,
+    current-redemptions: uint,
+    tier-required: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map reward-redemptions
+  { redemption-id: uint }
+  {
+    user: principal,
+    reward-id: uint,
+    redeemed-at: uint
+  }
+)
+
+(define-public (award-loyalty-points (user principal) (points uint))
+  (let
+    (
+      (current-points (default-to u0 (get total-points (map-get? loyalty-points { user: user }))))
+      (new-total (+ current-points points))
+    )
+    (map-set loyalty-points
+      { user: user }
+      { total-points: new-total }
+    )
+    (ok new-total)
+  )
 )
 
 (define-public (register-vendor (name (string-ascii 50)) (category (string-ascii 30)))
@@ -117,7 +183,12 @@
         })
       )
       (var-set next-review-id (+ review-id u1))
-      (ok review-id)
+      (let
+        (
+          (points-result (award-loyalty-points tx-sender u10))
+        )
+        (ok review-id)
+      )
     )
   )
 )
@@ -214,5 +285,220 @@
       (some (* avg-rating reputation-multiplier))
     )
     none
+  )
+)
+
+(define-public (subscribe-to-vendor (vendor-id uint) (tier uint))
+  (let
+    (
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+      (subscription-id (var-get next-subscription-id))
+      (existing-subscription (map-get? user-subscriptions { subscriber: tx-sender, vendor-id: vendor-id }))
+    )
+    (asserts! (and (>= tier u1) (<= tier u3)) ERR_INVALID_TIER)
+    (asserts! (is-none existing-subscription) ERR_ALREADY_SUBSCRIBED)
+    (asserts! (get is-active vendor) ERR_VENDOR_NOT_FOUND)
+    (asserts! (not (is-eq tx-sender (get owner vendor))) ERR_NOT_AUTHORIZED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      {
+        subscriber: tx-sender,
+        vendor-id: vendor-id,
+        tier: tier,
+        loyalty-points: u0,
+        subscription-date: stacks-block-height,
+        is-active: true
+      }
+    )
+    (map-set user-subscriptions
+      { subscriber: tx-sender, vendor-id: vendor-id }
+      { subscription-id: subscription-id }
+    )
+    (var-set next-subscription-id (+ subscription-id u1))
+    (let
+      (
+        (points-result (award-loyalty-points tx-sender u5))
+      )
+      (ok subscription-id)
+    )
+  )
+)
+
+(define-public (unsubscribe-from-vendor (vendor-id uint))
+  (let
+    (
+      (subscription-lookup (unwrap! (map-get? user-subscriptions { subscriber: tx-sender, vendor-id: vendor-id }) ERR_NOT_SUBSCRIBED))
+      (subscription-id (get subscription-id subscription-lookup))
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR_NOT_SUBSCRIBED))
+    )
+    (asserts! (get is-active subscription) ERR_NOT_SUBSCRIBED)
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (upgrade-subscription-tier (vendor-id uint) (new-tier uint))
+  (let
+    (
+      (subscription-lookup (unwrap! (map-get? user-subscriptions { subscriber: tx-sender, vendor-id: vendor-id }) ERR_NOT_SUBSCRIBED))
+      (subscription-id (get subscription-id subscription-lookup))
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR_NOT_SUBSCRIBED))
+      (current-tier (get tier subscription))
+    )
+    (asserts! (and (>= new-tier u1) (<= new-tier u3)) ERR_INVALID_TIER)
+    (asserts! (> new-tier current-tier) ERR_INVALID_TIER)
+    (asserts! (get is-active subscription) ERR_NOT_SUBSCRIBED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { tier: new-tier })
+    )
+    (let
+      (
+        (points-result (award-loyalty-points tx-sender (* (- new-tier current-tier) u3)))
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (deduct-loyalty-points (user principal) (points uint))
+  (let
+    (
+      (current-points (default-to u0 (get total-points (map-get? loyalty-points { user: user }))))
+    )
+    (asserts! (>= current-points points) ERR_INSUFFICIENT_POINTS)
+    (map-set loyalty-points
+      { user: user }
+      { total-points: (- current-points points) }
+    )
+    (ok (- current-points points))
+  )
+)
+
+(define-public (create-vendor-reward (vendor-id uint) (reward-name (string-ascii 50)) (points-required uint) (max-redemptions uint) (tier-required uint))
+  (let
+    (
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+      (reward-id (var-get next-reward-id))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= tier-required u1) (<= tier-required u3)) ERR_INVALID_TIER)
+    (asserts! (> points-required u0) ERR_INVALID_REWARD)
+    (asserts! (> max-redemptions u0) ERR_INVALID_REWARD)
+    
+    (map-set vendor-rewards
+      { reward-id: reward-id }
+      {
+        vendor-id: vendor-id,
+        reward-name: reward-name,
+        points-required: points-required,
+        max-redemptions: max-redemptions,
+        current-redemptions: u0,
+        tier-required: tier-required,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set next-reward-id (+ reward-id u1))
+    (ok reward-id)
+  )
+)
+
+(define-public (redeem-reward (reward-id uint))
+  (let
+    (
+      (reward (unwrap! (map-get? vendor-rewards { reward-id: reward-id }) ERR_INVALID_REWARD))
+      (vendor-id (get vendor-id reward))
+      (subscription-lookup (unwrap! (map-get? user-subscriptions { subscriber: tx-sender, vendor-id: vendor-id }) ERR_NOT_SUBSCRIBED))
+      (subscription-id (get subscription-id subscription-lookup))
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR_NOT_SUBSCRIBED))
+      (user-points (default-to u0 (get total-points (map-get? loyalty-points { user: tx-sender }))))
+      (redemption-id (var-get next-reward-id))
+    )
+    (asserts! (get is-active reward) ERR_INVALID_REWARD)
+    (asserts! (get is-active subscription) ERR_NOT_SUBSCRIBED)
+    (asserts! (>= (get tier subscription) (get tier-required reward)) ERR_INVALID_TIER)
+    (asserts! (>= user-points (get points-required reward)) ERR_INSUFFICIENT_POINTS)
+    (asserts! (< (get current-redemptions reward) (get max-redemptions reward)) ERR_INVALID_REWARD)
+    
+    (map-set reward-redemptions
+      { redemption-id: redemption-id }
+      {
+        user: tx-sender,
+        reward-id: reward-id,
+        redeemed-at: stacks-block-height
+      }
+    )
+    (map-set vendor-rewards
+      { reward-id: reward-id }
+      (merge reward { current-redemptions: (+ (get current-redemptions reward) u1) })
+    )
+    (try! (deduct-loyalty-points tx-sender (get points-required reward)))
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-user-subscription (subscriber principal) (vendor-id uint))
+  (match (map-get? user-subscriptions { subscriber: subscriber, vendor-id: vendor-id })
+    lookup (map-get? subscriptions { subscription-id: (get subscription-id lookup) })
+    none
+  )
+)
+
+(define-read-only (get-user-loyalty-points (user principal))
+  (default-to u0 (get total-points (map-get? loyalty-points { user: user })))
+)
+
+(define-read-only (get-vendor-reward (reward-id uint))
+  (map-get? vendor-rewards { reward-id: reward-id })
+)
+
+(define-read-only (is-subscribed (user principal) (vendor-id uint))
+  (match (get-user-subscription user vendor-id)
+    subscription (get is-active subscription)
+    false
+  )
+)
+
+(define-read-only (get-subscription-tier (user principal) (vendor-id uint))
+  (match (get-user-subscription user vendor-id)
+    subscription 
+    (if (get is-active subscription)
+      (some (get tier subscription))
+      none
+    )
+    none
+  )
+)
+
+(define-read-only (can-redeem-reward (user principal) (reward-id uint))
+  (match (map-get? vendor-rewards { reward-id: reward-id })
+    reward 
+    (let
+      (
+        (vendor-id (get vendor-id reward))
+        (user-points (get-user-loyalty-points user))
+        (user-tier (get-subscription-tier user vendor-id))
+      )
+      (and
+        (get is-active reward)
+        (>= user-points (get points-required reward))
+        (< (get current-redemptions reward) (get max-redemptions reward))
+        (match user-tier
+          tier (>= tier (get tier-required reward))
+          false
+        )
+      )
+    )
+    false
   )
 )
