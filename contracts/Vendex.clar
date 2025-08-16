@@ -10,6 +10,11 @@
 (define-constant ERR_INSUFFICIENT_POINTS (err u108))
 (define-constant ERR_INVALID_TIER (err u109))
 (define-constant ERR_INVALID_REWARD (err u110))
+(define-constant ERR_PRODUCT_NOT_FOUND (err u111))
+(define-constant ERR_INSUFFICIENT_INVENTORY (err u112))
+(define-constant ERR_INVALID_PRICE (err u113))
+(define-constant ERR_INVALID_QUANTITY (err u114))
+(define-constant ERR_PRODUCT_INACTIVE (err u115))
 
 (define-non-fungible-token vendor-nft uint)
 
@@ -17,6 +22,7 @@
 (define-data-var next-review-id uint u1)
 (define-data-var next-subscription-id uint u1)
 (define-data-var next-reward-id uint u1)
+(define-data-var next-product-id uint u1)
 
 (define-map vendors
   { vendor-id: uint }
@@ -96,6 +102,42 @@
     reward-id: uint,
     redeemed-at: uint
   }
+)
+
+(define-map products
+  { product-id: uint }
+  {
+    vendor-id: uint,
+    name: (string-ascii 100),
+    description: (string-ascii 500),
+    category: (string-ascii 50),
+    price: uint,
+    inventory: uint,
+    is-active: bool,
+    created-at: uint,
+    views: uint,
+    tags: (string-ascii 200)
+  }
+)
+
+(define-map vendor-products
+  { vendor-id: uint, product-id: uint }
+  { is-listed: bool }
+)
+
+(define-map product-analytics
+  { product-id: uint }
+  {
+    total-views: uint,
+    weekly-views: uint,
+    last-view-block: uint,
+    popularity-score: uint
+  }
+)
+
+(define-map product-categories
+  { category: (string-ascii 50) }
+  { product-count: uint }
 )
 
 (define-public (award-loyalty-points (user principal) (points uint))
@@ -502,3 +544,266 @@
     false
   )
 )
+
+(define-public (create-product (vendor-id uint) (name (string-ascii 100)) (description (string-ascii 500)) (category (string-ascii 50)) (price uint) (inventory uint) (tags (string-ascii 200)))
+  (let
+    (
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+      (product-id (var-get next-product-id))
+      (current-category-count (default-to u0 (get product-count (map-get? product-categories { category: category }))))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active vendor) ERR_VENDOR_NOT_FOUND)
+    (asserts! (> price u0) ERR_INVALID_PRICE)
+    (asserts! (>= inventory u0) ERR_INVALID_QUANTITY)
+    
+    (map-set products
+      { product-id: product-id }
+      {
+        vendor-id: vendor-id,
+        name: name,
+        description: description,
+        category: category,
+        price: price,
+        inventory: inventory,
+        is-active: true,
+        created-at: stacks-block-height,
+        views: u0,
+        tags: tags
+      }
+    )
+    (map-set vendor-products
+      { vendor-id: vendor-id, product-id: product-id }
+      { is-listed: true }
+    )
+    (map-set product-analytics
+      { product-id: product-id }
+      {
+        total-views: u0,
+        weekly-views: u0,
+        last-view-block: stacks-block-height,
+        popularity-score: u0
+      }
+    )
+    (map-set product-categories
+      { category: category }
+      { product-count: (+ current-category-count u1) }
+    )
+    (var-set next-product-id (+ product-id u1))
+    (ok product-id)
+  )
+)
+
+(define-public (update-product (product-id uint) (name (string-ascii 100)) (description (string-ascii 500)) (category (string-ascii 50)) (price uint) (tags (string-ascii 200)))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (vendor-id (get vendor-id product))
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+      (old-category (get category product))
+      (old-category-count (default-to u1 (get product-count (map-get? product-categories { category: old-category }))))
+      (new-category-count (default-to u0 (get product-count (map-get? product-categories { category: category }))))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active product) ERR_PRODUCT_INACTIVE)
+    (asserts! (> price u0) ERR_INVALID_PRICE)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product {
+        name: name,
+        description: description,
+        category: category,
+        price: price,
+        tags: tags
+      })
+    )
+    (if (not (is-eq old-category category))
+      (begin
+        (map-set product-categories
+          { category: old-category }
+          { product-count: (- old-category-count u1) }
+        )
+        (map-set product-categories
+          { category: category }
+          { product-count: (+ new-category-count u1) }
+        )
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-inventory (product-id uint) (new-inventory uint))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (vendor-id (get vendor-id product))
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active product) ERR_PRODUCT_INACTIVE)
+    (asserts! (>= new-inventory u0) ERR_INVALID_QUANTITY)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { inventory: new-inventory })
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-product (product-id uint))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (vendor-id (get vendor-id product))
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active product) ERR_PRODUCT_INACTIVE)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { is-active: false })
+    )
+    (map-set vendor-products
+      { vendor-id: vendor-id, product-id: product-id }
+      { is-listed: false }
+    )
+    (ok true)
+  )
+)
+
+(define-public (reactivate-product (product-id uint))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (vendor-id (get vendor-id product))
+      (vendor (unwrap! (map-get? vendors { vendor-id: vendor-id }) ERR_VENDOR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner vendor)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-active product)) ERR_PRODUCT_INACTIVE)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { is-active: true })
+    )
+    (map-set vendor-products
+      { vendor-id: vendor-id, product-id: product-id }
+      { is-listed: true }
+    )
+    (ok true)
+  )
+)
+
+(define-public (view-product (product-id uint))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (analytics (unwrap! (map-get? product-analytics { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (current-views (get views product))
+      (total-views (get total-views analytics))
+      (weekly-views (get weekly-views analytics))
+      (blocks-since-last (- stacks-block-height (get last-view-block analytics)))
+      (new-weekly-views (if (> blocks-since-last u1008) u1 (+ weekly-views u1)))
+      (popularity-score (+ (* new-weekly-views u10) (/ (+ total-views u1) u100)))
+    )
+    (asserts! (get is-active product) ERR_PRODUCT_INACTIVE)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { views: (+ current-views u1) })
+    )
+    (map-set product-analytics
+      { product-id: product-id }
+      {
+        total-views: (+ total-views u1),
+        weekly-views: new-weekly-views,
+        last-view-block: stacks-block-height,
+        popularity-score: popularity-score
+      }
+    )
+    (ok product)
+  )
+)
+
+(define-public (reserve-inventory (product-id uint) (quantity uint))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR_PRODUCT_NOT_FOUND))
+      (current-inventory (get inventory product))
+    )
+    (asserts! (get is-active product) ERR_PRODUCT_INACTIVE)
+    (asserts! (> quantity u0) ERR_INVALID_QUANTITY)
+    (asserts! (>= current-inventory quantity) ERR_INSUFFICIENT_INVENTORY)
+    
+    (map-set products
+      { product-id: product-id }
+      (merge product { inventory: (- current-inventory quantity) })
+    )
+    (ok (- current-inventory quantity))
+  )
+)
+
+(define-read-only (get-product (product-id uint))
+  (map-get? products { product-id: product-id })
+)
+
+(define-read-only (get-product-analytics (product-id uint))
+  (map-get? product-analytics { product-id: product-id })
+)
+
+(define-read-only (is-vendor-product (vendor-id uint) (product-id uint))
+  (is-some (map-get? vendor-products { vendor-id: vendor-id, product-id: product-id }))
+)
+
+(define-read-only (get-category-count (category (string-ascii 50)))
+  (default-to u0 (get product-count (map-get? product-categories { category: category })))
+)
+
+(define-read-only (is-product-available (product-id uint) (quantity uint))
+  (match (map-get? products { product-id: product-id })
+    product 
+    (and
+      (get is-active product)
+      (>= (get inventory product) quantity)
+      (> quantity u0)
+    )
+    false
+  )
+)
+
+(define-read-only (get-product-popularity (product-id uint))
+  (match (map-get? product-analytics { product-id: product-id })
+    analytics (some (get popularity-score analytics))
+    none
+  )
+)
+
+(define-read-only (calculate-product-value (product-id uint))
+  (match (map-get? products { product-id: product-id })
+    product 
+    (let
+      (
+        (price (get price product))
+        (inventory (get inventory product))
+        (views (get views product))
+        (analytics (map-get? product-analytics { product-id: product-id }))
+        (popularity (match analytics
+          some-analytics (get popularity-score some-analytics)
+          u0
+        ))
+      )
+      (some (+ (* price inventory) (* views u5) (* popularity u2)))
+    )
+    none
+  )
+)
+
+(define-read-only (get-next-product-id)
+  (var-get next-product-id)
+)
+
+
