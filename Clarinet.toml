@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Vendex.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.vendor-analytics]
+path = 'contracts/vendor-analytics.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
